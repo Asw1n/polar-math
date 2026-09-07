@@ -1,0 +1,24 @@
+{
+  "name": "polar-math",
+  "version": "0.1.0",
+  "description": "Prepared polar-table interpolation and target calculations.",
+  "main": "src/index.js",
+  "exports": {
+    ".": "./src/index.js"
+  },
+  "files": [
+    "src/",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node --test test/**/*.test.js",
+    "prepublishOnly": "npm test"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "polar-format": "file:../polar-format"
+  },
+  "license": "Apache-2.0"
+}

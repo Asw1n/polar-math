@@ -1,0 +1,301 @@
+'use strict'
+
+const { validatePolarTable } = require('polar-format')
+
+const PINCH_FACTOR = 0.9
+const PINCH_ANGLE = 25 * Math.PI / 180
+const RUN_EXTRAP_FACTOR = 0.3
+
+function validState(tws, twa = null) {
+  return { available: true, tws, twa }
+}
+
+function invalidState() {
+  return { available: false, reason: 'invalid_input', tws: null, twa: null }
+}
+
+function queryOptions(options, requireTwa) {
+  const { tws, twa, performanceFactor = 1 } = options || {}
+  if (!Number.isFinite(tws) || !Number.isFinite(performanceFactor) || performanceFactor < 0 ||
+      (requireTwa && !Number.isFinite(twa))) return null
+  return { tws, twa, performanceFactor }
+}
+
+function interpolate(a, b, ratio) {
+  return a + ratio * (b - a)
+}
+
+function roundToTwoDecimals(value) {
+  return Math.round(value * 100) / 100
+}
+
+class Polar {
+  static fromTable(table) {
+    const validation = validatePolarTable(table)
+    if (!validation.valid) {
+      throw new TypeError(`Invalid polar table: ${validation.errors.map(error => `${error.path} ${error.message}`).join('; ')}`)
+    }
+    return new Polar(table)
+  }
+
+  constructor(table) {
+    this.entries = prepareEntries(table)
+    Object.freeze(this.entries)
+  }
+
+  speedAt(options) {
+    const input = queryOptions(options, true)
+    if (!input) return { value: null, state: invalidState() }
+
+    const { tws, twa, performanceFactor } = input
+    const interpolation = this.findTwsInterpolation(tws)
+    const state = this.stateAt(tws, twa, interpolation)
+    if (state.twa === 'in_irons' || state.twa === 'above_range') return { value: null, state }
+
+    const lower = this.entries[interpolation.lowerIndex]
+    const upper = this.entries[interpolation.upperIndex]
+    const normalizedTwa = Math.abs(twa)
+    const lowerSpeed = speedFromEntry(lower, normalizedTwa)
+    const upperSpeed = speedFromEntry(upper, normalizedTwa)
+    if (lowerSpeed === null || upperSpeed === null) return { value: null, state }
+
+    return { value: interpolate(lowerSpeed, upperSpeed, interpolation.ratio) * performanceFactor, state }
+  }
+
+  vmgAt(options) {
+    const input = queryOptions(options, true)
+    if (!input) return { value: null, state: invalidState() }
+
+    const speed = this.speedAt(input)
+    return { value: speed.value === null ? null : speed.value * Math.cos(input.twa), state: speed.state }
+  }
+
+  targetsAt(options) {
+    const input = queryOptions(options, false)
+    if (!input) return { value: null, state: invalidState() }
+
+    const interpolation = this.findTwsInterpolation(input.tws)
+    const lower = this.entries[interpolation.lowerIndex]
+    const upper = this.entries[interpolation.upperIndex]
+    const scale = input.performanceFactor
+    const target = (key) => interpolate(lower[key], upper[key], interpolation.ratio)
+    const beatAngle = target('beatAngle')
+    const runAngle = target('runAngle')
+    const beatSpeed = target('beatSpeed') * scale
+    const runSpeed = target('runSpeed') * scale
+    const maxSpeed = target('maxSpeed') * scale
+
+    return {
+      value: {
+        beat: { twa: beatAngle, speed: beatSpeed, vmg: target('beatVmg') * scale },
+        run: { twa: runAngle, speed: runSpeed, vmg: target('runVmg') * scale },
+        maxSpeed: { twa: target('maxSpeedAngle'), speed: maxSpeed }
+      },
+      state: validState(this.twsState(input.tws), null)
+    }
+  }
+
+  rangeAt(options) {
+    const input = queryOptions(options, false)
+    if (!input) return { value: null, state: invalidState() }
+
+    const interpolation = this.findTwsInterpolation(input.tws)
+    const lower = this.entries[interpolation.lowerIndex]
+    const upper = this.entries[interpolation.upperIndex]
+    const lowerLimit = lower.runExtrap?.extrapLimit ?? lower.points.at(-1).twa
+    const upperLimit = upper.runExtrap?.extrapLimit ?? upper.points.at(-1).twa
+    const minTwa = PINCH_FACTOR * interpolate(lower.beatAngle, upper.beatAngle, interpolation.ratio)
+    return {
+      value: { minTwa, maxTwa: interpolate(lowerLimit, upperLimit, interpolation.ratio) },
+      state: validState(this.twsState(input.tws), null)
+    }
+  }
+
+  findTwsInterpolation(tws) {
+    let lowerIndex = -1
+    let upperIndex = -1
+    for (let index = 0; index < this.entries.length; index += 1) {
+      if (this.entries[index].tws <= tws) lowerIndex = index
+      if (this.entries[index].tws >= tws && upperIndex === -1) upperIndex = index
+    }
+    if (lowerIndex === -1) return { lowerIndex: 0, upperIndex: 0, ratio: 0 }
+    if (upperIndex === -1) {
+      const lastIndex = this.entries.length - 1
+      return { lowerIndex: lastIndex, upperIndex: lastIndex, ratio: 0 }
+    }
+    if (lowerIndex === upperIndex) return { lowerIndex, upperIndex, ratio: 0 }
+    return {
+      lowerIndex,
+      upperIndex,
+      ratio: (tws - this.entries[lowerIndex].tws) / (this.entries[upperIndex].tws - this.entries[lowerIndex].tws)
+    }
+  }
+
+  twsState(tws) {
+    const first = this.entries[1] || this.entries[0]
+    const last = this.entries.at(-1)
+    if (tws < first.tws) return 'below_range'
+    if (tws > last.tws) return 'above_range'
+    return 'in_range'
+  }
+
+  stateAt(tws, twa, interpolation = this.findTwsInterpolation(tws)) {
+    const normalizedTwa = Math.abs(twa)
+    const lower = this.entries[interpolation.lowerIndex]
+    const upper = this.entries[interpolation.upperIndex]
+    const beatAngle = interpolate(lower.beatAngle, upper.beatAngle, interpolation.ratio)
+    let twaState = 'in_range'
+    if (normalizedTwa < PINCH_FACTOR * beatAngle) twaState = 'in_irons'
+    else if (normalizedTwa < beatAngle) twaState = 'pinching'
+    else {
+      const lastTwa = Math.max(lower.points.at(-1).twa, upper.points.at(-1).twa)
+      const lowerLimit = lower.runExtrap?.extrapLimit ?? lower.points.at(-1).twa
+      const upperLimit = upper.runExtrap?.extrapLimit ?? upper.points.at(-1).twa
+      const extrapLimit = interpolate(lowerLimit, upperLimit, interpolation.ratio)
+      if (normalizedTwa > extrapLimit) twaState = 'above_range'
+      else if (normalizedTwa > lastTwa) twaState = 'extrapolated'
+    }
+    return validState(this.twsState(tws), twaState)
+  }
+}
+
+function prepareEntries(table) {
+  const targets = fillDerivedTargets(table.axes.tws, table.derived?.rows || [])
+  const entries = table.axes.tws.map((tws, rowIndex) => {
+    const points = table.axes.twa
+      .map((twa, colIndex) => ({ twa, speed: table.values.boatSpeedMatrix[rowIndex][colIndex] }))
+      .filter(point => point.speed > 0)
+    const target = targets[rowIndex]
+    addTarget(points, target.beat)
+    addTarget(points, target.run)
+    points.sort((a, b) => a.twa - b.twa)
+    const derived = deriveTargets(points, target)
+    return { tws, points, ...derived }
+  })
+
+  const first = entries[0]
+  entries.unshift({
+    tws: 0.0001,
+    points: first.points.map(point => ({ ...point, speed: 0 })),
+    beatAngle: first.beatAngle,
+    beatSpeed: 0,
+    beatVmg: 0,
+    runAngle: first.runAngle,
+    runSpeed: 0,
+    runVmg: 0,
+    maxSpeed: 0,
+    maxSpeedAngle: first.maxSpeedAngle
+  })
+  entries.forEach(addExtrapolation)
+  return entries.map(entry => Object.freeze({ ...entry, points: Object.freeze(entry.points.map(Object.freeze)) }))
+}
+
+function addTarget(points, target) {
+  if (!target) return
+  const index = points.findIndex(point => point.twa === target.twa)
+  const point = { twa: target.twa, speed: target.tbs }
+  if (index >= 0) points[index] = point
+  else points.push(point)
+}
+
+function deriveTargets(points, target) {
+  const best = (predicate) => points.filter(predicate).reduce((result, point) =>
+    !result || point.speed * Math.abs(Math.cos(point.twa)) > result.speed * Math.abs(Math.cos(result.twa)) ? point : result, null)
+  const beat = target.beat || best(point => point.twa < Math.PI / 2)
+  const run = target.run || best(point => point.twa >= Math.PI / 2)
+  const max = points.reduce((result, point) => point.speed > result.speed ? point : result)
+  return {
+    beatAngle: beat.twa, beatSpeed: beat.tbs ?? beat.speed,
+    beatVmg: roundToTwoDecimals(beat.vmg ?? beat.speed * Math.abs(Math.cos(beat.twa))),
+    runAngle: run.twa, runSpeed: run.tbs ?? run.speed,
+    runVmg: roundToTwoDecimals(run.vmg ?? run.speed * Math.abs(Math.cos(run.twa))),
+    maxSpeed: max.speed, maxSpeedAngle: max.twa
+  }
+}
+
+function addExtrapolation(entry) {
+  const beatIndex = entry.points.findIndex(point => point.twa === entry.beatAngle)
+  if (entry.beatAngle > PINCH_ANGLE && beatIndex >= 0) {
+    const beat = entry.points[beatIndex]
+    const next = entry.points[beatIndex + 1]
+    const slope = next ? (next.speed - beat.speed) / (next.twa - beat.twa) : 0
+    const distance = entry.beatAngle - PINCH_ANGLE
+    const a = (slope * distance - beat.speed) / (distance * distance)
+    entry.beatExtrap = { a, b: slope - 2 * a * distance }
+  }
+  const runIndex = entry.points.findIndex(point => point.twa === entry.runAngle)
+  if (runIndex >= 0 && entry.runAngle - Math.PI / 2 > 1e-6) {
+    const runVmg = entry.points[runIndex].speed * Math.cos(entry.runAngle)
+    entry.runExtrap = {
+      runVmg,
+      omega: Math.PI / (2 * (entry.runAngle - Math.PI / 2)),
+      extrapLimit: entry.points.at(-1).twa + (Math.PI - entry.runAngle) * RUN_EXTRAP_FACTOR
+    }
+  }
+}
+
+function speedFromEntry(entry, twa) {
+  if (twa < entry.beatAngle) {
+    if (!entry.beatExtrap || twa <= PINCH_ANGLE) return 0
+    const distance = twa - PINCH_ANGLE
+    return Math.max(0, entry.beatExtrap.a * distance * distance + entry.beatExtrap.b * distance)
+  }
+  const last = entry.points.at(-1)
+  if (twa > last.twa) {
+    if (!entry.runExtrap || twa > Math.PI) return null
+    const vmg = entry.runExtrap.runVmg * Math.cos(entry.runExtrap.omega * (twa - entry.runAngle))
+    const cosine = Math.cos(twa)
+    return Math.abs(cosine) < 1e-9 ? null : Math.max(0, vmg / cosine)
+  }
+  let lower = -1
+  let upper = -1
+  for (let index = 0; index < entry.points.length; index += 1) {
+    if (entry.points[index].twa <= twa) lower = index
+    if (entry.points[index].twa >= twa && upper === -1) upper = index
+  }
+  if (lower === -1) return null
+  if (upper === -1 || lower === upper) return entry.points[lower].speed
+  const low = entry.points[lower]
+  const high = entry.points[upper]
+  return interpolate(low.speed, high.speed, (twa - low.twa) / (high.twa - low.twa))
+}
+
+function fillDerivedTargets(twsAxis, rows) {
+  const targets = twsAxis.map(tws => {
+    const row = rows.find(candidate => Math.abs(candidate.tws - tws) < 1e-6)
+    return {
+      beat: validTarget(row?.beat) ? { ...row.beat } : null,
+      run: validTarget(row?.run) ? { ...row.run } : null
+    }
+  })
+  for (const key of ['beat', 'run']) {
+    for (let index = 0; index < targets.length; index += 1) {
+      if (targets[index][key]) continue
+      const lower = findTarget(targets, key, index, -1)
+      const upper = findTarget(targets, key, index, 1)
+      if (lower >= 0 && upper >= 0) {
+        const ratio = (twsAxis[index] - twsAxis[lower]) / (twsAxis[upper] - twsAxis[lower])
+        const low = targets[lower][key]
+        const high = targets[upper][key]
+        const twa = interpolate(low.twa, high.twa, ratio)
+        const tbs = interpolate(low.tbs, high.tbs, ratio)
+        targets[index][key] = { twa, tbs, vmg: tbs * Math.abs(Math.cos(twa)) }
+      } else if (lower >= 0) targets[index][key] = { ...targets[lower][key] }
+      else if (upper >= 0) targets[index][key] = { ...targets[upper][key] }
+    }
+  }
+  return targets
+}
+
+function validTarget(target) {
+  return Number.isFinite(target?.twa) && Number.isFinite(target?.tbs)
+}
+
+function findTarget(targets, key, from, direction) {
+  for (let index = from + direction; index >= 0 && index < targets.length; index += direction) {
+    if (targets[index][key]) return index
+  }
+  return -1
+}
+
+module.exports = { Polar }
