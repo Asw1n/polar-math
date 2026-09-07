@@ -18,7 +18,7 @@
     "node": ">=20"
   },
   "dependencies": {
-    "polar-format": "file:../polar-format"
+    "polar-format": "^1.0.0"
   },
   "license": "Apache-2.0"
 }
