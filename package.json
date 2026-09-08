@@ -1,14 +1,24 @@
 {
   "name": "polar-math",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "description": "Prepared polar-table interpolation and target calculations.",
+  "keywords": [
+    "polar",
+    "polar-table",
+    "sailing",
+    "performance",
+    "signalk",
+    "interpolation"
+  ],
   "main": "src/index.js",
   "exports": {
     ".": "./src/index.js"
   },
   "files": [
     "src/",
-    "README.md"
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
   ],
   "scripts": {
     "test": "node --test test/**/*.test.js",
@@ -20,5 +30,14 @@
   "dependencies": {
     "polar-format": "^1.0.0"
   },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Asw1n/polar-math.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Asw1n/polar-math/issues"
+  },
+  "homepage": "https://github.com/Asw1n/polar-math#readme",
+  "author": "aswin.bouwmeester@gmail.com",
   "license": "Apache-2.0"
 }
