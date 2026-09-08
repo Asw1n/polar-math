@@ -17,7 +17,7 @@ function invalidState() {
 function queryOptions(options, requireTwa) {
   const { tws, twa, performanceFactor = 1 } = options || {}
   if (!Number.isFinite(tws) || !Number.isFinite(performanceFactor) || performanceFactor < 0 ||
-      (requireTwa && !Number.isFinite(twa))) return null
+      (requireTwa && (!Number.isFinite(twa) || Math.abs(twa) > Math.PI))) return null
   return { tws, twa, performanceFactor }
 }
 
@@ -39,6 +39,8 @@ class Polar {
   }
 
   constructor(table) {
+    // validatePolarTable requires symmetry.portStarboardSymmetric === true; queries below rely on that
+    // and always mirror speed across the beam (Math.abs(twa)). There is no asymmetric-table support yet.
     this.entries = prepareEntries(table)
     Object.freeze(this.entries)
   }

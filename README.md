@@ -16,8 +16,25 @@ const range = polar.rangeAt({ tws })
 ```
 
 `state` always includes `available`. For valid queries it also includes the TWS range state and, for
-angle-dependent calls, the TWA range state. Invalid numeric input returns `value: null` and
-`state.reason: 'invalid_input'`.
+angle-dependent calls, the TWA range state. Invalid numeric input (including a `twa` outside `[-π, π]`)
+returns `value: null` and `state.reason: 'invalid_input'`.
 
-The performance factor is deliberately a per-query input. A Signal K plugin may subscribe to a shared
-`vessels.self.polars.performanceFactor` setting and pass its current value to every query.
+`state.tws` is one of:
+- `in_range` — within the table's TWS axis
+- `below_range` — below the lowest TWS row (result is clamped to it)
+- `above_range` — above the highest TWS row (result is clamped to it)
+
+`state.twa` (angle-dependent calls only) is one of:
+- `in_range` — within the sailable TWA range
+- `pinching` — between the pinch boundary and the beat angle; a reduced positive speed is returned
+- `in_irons` — below the pinch boundary; `speedAt`/`vmgAt` return `value: null`
+- `extrapolated` — beyond the table's last TWA column but within the modeled run extrapolation
+- `above_range` — beyond the run extrapolation limit; `speedAt`/`vmgAt` return `value: null`
+
+The performance factor is deliberately a per-query input. 
+
+## Symmetry
+
+Only port/starboard-symmetric tables are supported: `polar-format` requires
+`symmetry.portStarboardSymmetric: true`, and all lookups here always mirror speed across the beam
+(`Math.abs(twa)`). There is no asymmetric-table support yet.
