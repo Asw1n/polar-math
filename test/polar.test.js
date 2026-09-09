@@ -31,6 +31,13 @@ const TABLE = {
 
 const polar = Polar.fromTable(TABLE)
 const closeTo = (actual, expected, tolerance = 1e-6) => Math.abs(actual - expected) <= tolerance
+const sparseTable = (speeds, twa = [40, 60, 80, 100, 120, 150, 180]) => ({
+  kind: 'polarTable', schemaVersion: '1.0.0', name: 'Sparse Polar',
+  units: { tws: 'm/s', twa: 'rad', boatSpeed: 'm/s' },
+  symmetry: { portStarboardSymmetric: true },
+  axes: { tws: [10 * KNOTS], twa: twa.map(radians) },
+  values: { boatSpeedMatrix: [speeds.map(knots => knots * KNOTS)] }
+})
 
 describe('Polar', () => {
   it('rejects an invalid canonical polar table when preparing it', () => {
@@ -96,5 +103,72 @@ describe('Polar', () => {
     assert.equal(outside.value, null)
     assert.ok(atMax.value !== null)
     assert.equal(result.state.twa, null)
+  })
+
+  it('supports a row with only reaching and downwind positive speeds', () => {
+    const sparse = Polar.fromTable(sparseTable([0, 0, 0, 6, 7, 6.5, 5]))
+    const range = sparse.rangeAt({ tws: 10 * KNOTS })
+    const targets = sparse.targetsAt({ tws: 10 * KNOTS })
+    const inside = sparse.speedAt({ tws: 10 * KNOTS, twa: radians(110) })
+    const outside = sparse.speedAt({ tws: 10 * KNOTS, twa: radians(80) })
+
+    assert.ok(closeTo(range.value.minTwa, radians(100)))
+    assert.ok(closeTo(range.value.maxTwa, Math.PI))
+    assert.equal(targets.value.beat, null)
+    assert.ok(targets.value.run)
+    assert.ok(targets.value.maxSpeed.speed > 0)
+    assert.ok(Number.isFinite(inside.value) && inside.value > 0)
+    assert.equal(outside.value, null)
+    assert.equal(outside.state.twa, 'below_range')
+  })
+
+  it('supports a row with only upwind positive speeds', () => {
+    const sparse = Polar.fromTable(sparseTable([4, 5, 5.5, 0, 0, 0, 0]))
+    const range = sparse.rangeAt({ tws: 10 * KNOTS })
+    const targets = sparse.targetsAt({ tws: 10 * KNOTS })
+    const inside = sparse.speedAt({ tws: 10 * KNOTS, twa: radians(70) })
+
+    assert.ok(targets.value.beat)
+    assert.equal(targets.value.run, null)
+    assert.ok(closeTo(range.value.maxTwa, radians(80)))
+    assert.ok(Number.isFinite(inside.value) && inside.value > 0)
+  })
+
+  it('does not extrapolate a lone positive point', () => {
+    const sparse = Polar.fromTable(sparseTable([0, 0, 0, 6, 0, 0, 0]))
+    const range = sparse.rangeAt({ tws: 10 * KNOTS })
+
+    assert.ok(closeTo(range.value.minTwa, radians(100)))
+    assert.ok(closeTo(range.value.maxTwa, radians(100)))
+    assert.ok(sparse.speedAt({ tws: 10 * KNOTS, twa: radians(100) }).value > 0)
+    assert.equal(sparse.speedAt({ tws: 10 * KNOTS, twa: radians(110) }).value, null)
+  })
+
+  it('skips empty rows while retaining sane interpolation and TWS state', () => {
+    const table = sparseTable([4, 5, 5.5, 5, 4.5, 4, 3])
+    table.axes.tws = [10 * KNOTS, 20 * KNOTS, 30 * KNOTS]
+    table.values.boatSpeedMatrix = [
+      [4, 5, 5.5, 5, 4.5, 4, 3].map(knots => knots * KNOTS),
+      [0, 0, 0, 0, 0, 0, 0],
+      [6, 7, 7.5, 7, 6.5, 6, 5].map(knots => knots * KNOTS)
+    ]
+    const sparse = Polar.fromTable(table)
+    const result = sparse.speedAt({ tws: 20 * KNOTS, twa: radians(80) })
+
+    assert.ok(Number.isFinite(result.value) && result.value > 0)
+    assert.equal(result.state.tws, 'in_range')
+  })
+
+  it('returns a deliberate unavailable state when every row is empty', () => {
+    const sparse = Polar.fromTable(sparseTable([0, 0, 0, 0, 0, 0, 0]))
+
+    assert.deepEqual(sparse.speedAt({ tws: 10 * KNOTS, twa: radians(100) }), {
+      value: null,
+      state: { available: false, reason: 'no_data', tws: null, twa: null }
+    })
+    assert.deepEqual(sparse.targetsAt({ tws: 10 * KNOTS }), {
+      value: null,
+      state: { available: false, reason: 'no_data', tws: null, twa: null }
+    })
   })
 })

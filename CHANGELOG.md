@@ -3,6 +3,15 @@
 All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 1.0.1 - 2026-09-10
+
+### Fixed
+
+- Accept sparse polar rows containing valid speeds on only the upwind or downwind side.
+- Report unavailable beat or run targets as `null` while retaining the available targets and maximum speed.
+- Report each row's actual computable angle range and avoid extrapolation when there is insufficient supporting data.
+- Skip empty rows during interpolation and return a clear unavailable state when a table contains no positive speeds.
+
 ## 1.0.0 - 2026-09-09
 
 First published release. Pure polar-table calculations extracted from `signalk-polar-performance-plugin`, built on top of `polar-format`.
