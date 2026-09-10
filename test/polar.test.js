@@ -171,4 +171,72 @@ describe('Polar', () => {
       state: { available: false, reason: 'no_data', tws: null, twa: null }
     })
   })
+
+  describe('run-side (gybe) extrapolation beyond the deepest known angle', () => {
+    const gybeTable = (twa = [100, 120, 140], speeds = [6, 7, 6.8]) => sparseTable(speeds, twa)
+
+    it('extrapolates to 180deg with monotonically non-increasing VMG', () => {
+      const sparse = Polar.fromTable(gybeTable())
+      const range = sparse.rangeAt({ tws: 10 * KNOTS })
+      assert.ok(closeTo(range.value.maxTwa, Math.PI))
+
+      const vmgAt = (deg) => sparse.vmgAt({ tws: 10 * KNOTS, twa: radians(deg) }).value
+      const vmg140 = Math.abs(vmgAt(140))
+      const vmg160 = Math.abs(vmgAt(160))
+      const vmg180 = Math.abs(vmgAt(180))
+      assert.ok(vmg160 > 0 && vmg160 <= vmg140)
+      assert.ok(vmg180 > 0 && vmg180 <= vmg160)
+      assert.ok(sparse.speedAt({ tws: 10 * KNOTS, twa: radians(160) }).value > 0)
+      assert.ok(sparse.speedAt({ tws: 10 * KNOTS, twa: radians(180) }).value > 0)
+    })
+
+    it('does not extrapolate beyond real data when the axis already reaches 180deg', () => {
+      const sparse = Polar.fromTable(gybeTable([100, 120, 140, 180], [6, 7, 6.8, 6.8]))
+      const range = sparse.rangeAt({ tws: 10 * KNOTS })
+      assert.ok(closeTo(range.value.maxTwa, Math.PI))
+      // real datapoint at 180deg is used as-is, not overridden by a mirrored value
+      assert.ok(closeTo(sparse.speedAt({ tws: 10 * KNOTS, twa: radians(180) }).value, 6.8 * KNOTS))
+    })
+
+    it('does not throw for a single positive point already at 180deg', () => {
+      const sparse = Polar.fromTable(sparseTable([0, 0, 0, 0, 0, 0, 5]))
+      const range = sparse.rangeAt({ tws: 10 * KNOTS })
+      assert.ok(closeTo(range.value.maxTwa, Math.PI))
+      assert.ok(closeTo(sparse.speedAt({ tws: 10 * KNOTS, twa: radians(180) }).value, 5 * KNOTS))
+    })
+  })
+
+  describe('extrapolate: false opts out of both beat pinch and run extension', () => {
+    it('reports the real (unextrapolated) TWA range', () => {
+      const extrapolated = polar.rangeAt({ tws: 12 * KNOTS })
+      const real = polar.rangeAt({ tws: 12 * KNOTS, extrapolate: false })
+      assert.ok(real.value.minTwa > extrapolated.value.minTwa)
+      assert.ok(real.value.maxTwa < extrapolated.value.maxTwa)
+      // TABLE's tws=12 row has a derived beat target (39.6deg) below the axis's smallest angle (52deg)
+      assert.ok(closeTo(real.value.minTwa, radians(39.6)))
+    })
+
+    it('returns null beyond the last real datapoint on both sides', () => {
+      const beat = polar.targetsAt({ tws: 12 * KNOTS }).value.beat
+      const pinching = polar.speedAt({ tws: 12 * KNOTS, twa: 0.95 * beat.twa, extrapolate: false })
+      assert.equal(pinching.value, null)
+      assert.equal(pinching.state.twa, 'below_range')
+
+      const beyondLast = polar.speedAt({ tws: 12 * KNOTS, twa: radians(170), extrapolate: false })
+      assert.equal(beyondLast.value, null)
+      assert.equal(beyondLast.state.twa, 'above_range')
+    })
+
+    it('still returns real interpolated values within the measured range', () => {
+      const result = polar.speedAt({ tws: 12 * KNOTS, twa: radians(90), extrapolate: false })
+      assert.ok(closeTo(result.value, 6.82 * KNOTS))
+      assert.equal(result.state.twa, 'in_range')
+    })
+
+    it('defaults to extrapolate: true when the option is omitted', () => {
+      const withOption = polar.rangeAt({ tws: 12 * KNOTS, extrapolate: true })
+      const withoutOption = polar.rangeAt({ tws: 12 * KNOTS })
+      assert.deepEqual(withoutOption.value, withOption.value)
+    })
+  })
 })

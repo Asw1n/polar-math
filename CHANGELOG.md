@@ -3,6 +3,20 @@
 All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 1.1.0 - 2026-09-10
+
+### Added
+
+- `extrapolate` option (default `true`) on `speedAt`, `vmgAt`, and `rangeAt` to opt out of both beat-side
+  pinch and run-side extension and restrict results to real (measured/target) data.
+- README section documenting the interpolation and extrapolation model.
+
+### Changed
+
+- Replaced the run-side (gybe) cosine extrapolation with a mirror-point + VMG-taper model: a single point
+  mirrors the measured VMG rise around the run angle, then VMG slope is tapered linearly to zero at 180deg.
+  This reliably reaches 180deg and is slope-continuous with the real data, unlike the previous model.
+
 ## 1.0.1 - 2026-09-10
 
 ### Fixed

@@ -4,7 +4,7 @@ const { validatePolarTable } = require('polar-format')
 
 const PINCH_FACTOR = 0.9
 const PINCH_ANGLE = 25 * Math.PI / 180
-const RUN_EXTRAP_FACTOR = 0.3
+const EPSILON = 1e-9
 
 function validState(tws, twa = null) {
   return { available: true, tws, twa }
@@ -19,10 +19,10 @@ function noDataState() {
 }
 
 function queryOptions(options, requireTwa) {
-  const { tws, twa, performanceFactor = 1 } = options || {}
+  const { tws, twa, performanceFactor = 1, extrapolate = true } = options || {}
   if (!Number.isFinite(tws) || !Number.isFinite(performanceFactor) || performanceFactor < 0 ||
       (requireTwa && (!Number.isFinite(twa) || Math.abs(twa) > Math.PI))) return null
-  return { tws, twa, performanceFactor }
+  return { tws, twa, performanceFactor, extrapolate: extrapolate !== false }
 }
 
 function interpolate(a, b, ratio) {
@@ -54,9 +54,9 @@ class Polar {
     if (!input) return { value: null, state: invalidState() }
     if (this.entries.length === 0) return { value: null, state: noDataState() }
 
-    const { tws, twa, performanceFactor } = input
+    const { tws, twa, performanceFactor, extrapolate } = input
     const interpolation = this.findTwsInterpolation(tws)
-    const state = this.stateAt(tws, twa, interpolation)
+    const state = this.stateAt(tws, twa, extrapolate, interpolation)
     if (state.twa === 'below_range' || state.twa === 'in_irons' || state.twa === 'above_range') {
       return { value: null, state }
     }
@@ -64,8 +64,8 @@ class Polar {
     const lower = this.entries[interpolation.lowerIndex]
     const upper = this.entries[interpolation.upperIndex]
     const normalizedTwa = Math.abs(twa)
-    const lowerSpeed = speedFromEntry(lower, normalizedTwa)
-    const upperSpeed = speedFromEntry(upper, normalizedTwa)
+    const lowerSpeed = speedFromEntry(lower, normalizedTwa, extrapolate)
+    const upperSpeed = speedFromEntry(upper, normalizedTwa, extrapolate)
     if (lowerSpeed === null || upperSpeed === null) return { value: null, state }
 
     return { value: interpolate(lowerSpeed, upperSpeed, interpolation.ratio) * performanceFactor, state }
@@ -122,8 +122,8 @@ class Polar {
     const upper = this.entries[interpolation.upperIndex]
     return {
       value: {
-        minTwa: interpolate(minTwaForEntry(lower), minTwaForEntry(upper), interpolation.ratio),
-        maxTwa: interpolate(maxTwaForEntry(lower), maxTwaForEntry(upper), interpolation.ratio)
+        minTwa: interpolate(minTwaForEntry(lower, input.extrapolate), minTwaForEntry(upper, input.extrapolate), interpolation.ratio),
+        maxTwa: interpolate(maxTwaForEntry(lower, input.extrapolate), maxTwaForEntry(upper, input.extrapolate), interpolation.ratio)
       },
       state: validState(this.twsState(input.tws), null)
     }
@@ -157,22 +157,30 @@ class Polar {
     return 'in_range'
   }
 
-  stateAt(tws, twa, interpolation = this.findTwsInterpolation(tws)) {
+  stateAt(tws, twa, extrapolate = true, interpolation = this.findTwsInterpolation(tws)) {
     if (this.entries.length === 0) return noDataState()
 
     const normalizedTwa = Math.abs(twa)
     const lower = this.entries[interpolation.lowerIndex]
     const upper = this.entries[interpolation.upperIndex]
+    const minTwa = interpolate(minTwaForEntry(lower, extrapolate), minTwaForEntry(upper, extrapolate), interpolation.ratio)
+    const maxTwa = interpolate(maxTwaForEntry(lower, extrapolate), maxTwaForEntry(upper, extrapolate), interpolation.ratio)
+
+    if (!extrapolate) {
+      let twaState = 'in_range'
+      if (normalizedTwa < minTwa) twaState = 'below_range'
+      else if (normalizedTwa > maxTwa) twaState = 'above_range'
+      return validState(this.twsState(tws), twaState)
+    }
+
     const hasBeat = Number.isFinite(lower.beatAngle) && Number.isFinite(upper.beatAngle)
     const beatAngle = hasBeat ? interpolate(lower.beatAngle, upper.beatAngle, interpolation.ratio) : null
-    const minTwa = interpolate(minTwaForEntry(lower), minTwaForEntry(upper), interpolation.ratio)
     let twaState = 'in_range'
     if (normalizedTwa < minTwa) twaState = hasBeat ? 'in_irons' : 'below_range'
     else if (hasBeat && normalizedTwa < beatAngle) twaState = 'pinching'
     else {
       const lastTwa = Math.max(lower.points.at(-1).twa, upper.points.at(-1).twa)
-      const extrapLimit = interpolate(maxTwaForEntry(lower), maxTwaForEntry(upper), interpolation.ratio)
-      if (normalizedTwa > extrapLimit) twaState = 'above_range'
+      if (normalizedTwa > maxTwa) twaState = 'above_range'
       else if (normalizedTwa > lastTwa) twaState = 'extrapolated'
     }
     return validState(this.twsState(tws), twaState)
@@ -182,11 +190,12 @@ class Polar {
 function prepareEntries(table) {
   const targets = fillDerivedTargets(table.axes.tws, table.derived?.rows || [])
   const entries = table.axes.tws.flatMap((tws, rowIndex) => {
-    const points = table.axes.twa
+    const axisPoints = table.axes.twa
       .map((twa, colIndex) => ({ twa, speed: table.values.boatSpeedMatrix[rowIndex][colIndex] }))
       .filter(point => point.speed > 0)
-    if (points.length === 0) return []
+    if (axisPoints.length === 0) return []
 
+    const points = axisPoints.slice()
     const target = {
       beat: points.some(point => point.twa < Math.PI / 2) ? targets[rowIndex].beat : null,
       run: points.some(point => point.twa >= Math.PI / 2) ? targets[rowIndex].run : null
@@ -195,7 +204,8 @@ function prepareEntries(table) {
     addTarget(points, target.run)
     points.sort((a, b) => a.twa - b.twa)
     const derived = deriveTargets(points, target)
-    return [{ tws, points, ...derived }]
+    const { points: extendedPoints, runFlatten } = addRunExtension(axisPoints, points, derived)
+    return [{ tws, points: extendedPoints, realPoints: points, runFlatten, ...derived }]
   })
 
   if (entries.length === 0) return []
@@ -204,6 +214,8 @@ function prepareEntries(table) {
   entries.unshift({
     tws: 0.0001,
     points: first.points.map(point => ({ ...point, speed: 0 })),
+    realPoints: first.realPoints.map(point => ({ ...point, speed: 0 })),
+    runFlatten: first.runFlatten ? { ...first.runFlatten, anchorVmg: 0, a: 0, b: 0 } : null,
     beatAngle: first.beatAngle,
     beatSpeed: 0,
     beatVmg: 0,
@@ -214,7 +226,61 @@ function prepareEntries(table) {
     maxSpeedAngle: first.maxSpeedAngle
   })
   entries.forEach(addExtrapolation)
-  return entries.map(entry => Object.freeze({ ...entry, points: Object.freeze(entry.points.map(Object.freeze)) }))
+  return entries.map(entry => Object.freeze({
+    ...entry,
+    points: Object.freeze(entry.points.map(Object.freeze)),
+    realPoints: Object.freeze(entry.realPoints.map(Object.freeze))
+  }))
+}
+
+// Extends the run side of the curve with at most one mirrored point beyond the
+// deepest known angle, then a quadratic VMG taper to zero slope at 180deg.
+// See run-extrapolation design discussion (mirror point + VMG flattening) for rationale.
+function addRunExtension(axisPoints, points, derived) {
+  if (!Number.isFinite(derived.runAngle)) return { points, runFlatten: null }
+
+  let extended = points
+  const referenceAngle = findReferenceAngle(axisPoints, derived.runAngle)
+  if (referenceAngle !== null) {
+    let mirrorAngle = 2 * derived.runAngle - referenceAngle
+    if (Math.abs(mirrorAngle - Math.PI) < EPSILON) mirrorAngle = Math.PI // snap float noise onto the exact boundary
+    const maxKnownAngle = points.at(-1).twa
+    const mirrorCosine = Math.abs(Math.cos(mirrorAngle))
+    // Skip the mirror point entirely if its true (uncapped) position is beyond
+    // 180deg -- placing it clamped at pi would encode the wrong VMG right at the
+    // boundary and short-circuit the smooth taper below.
+    if (mirrorAngle <= Math.PI && mirrorAngle > maxKnownAngle + EPSILON && mirrorCosine > EPSILON) {
+      const reference = axisPoints.find(point => point.twa === referenceAngle)
+      const referenceVmg = reference.speed * Math.abs(Math.cos(reference.twa))
+      const mirrorSpeed = Math.max(0, referenceVmg / mirrorCosine)
+      extended = [...points, { twa: mirrorAngle, speed: mirrorSpeed }].sort((a, b) => a.twa - b.twa)
+    }
+  }
+
+  const anchor = extended.at(-1)
+  const previous = extended.at(-2)
+  if (!previous || anchor.twa >= Math.PI - EPSILON) return { points: extended, runFlatten: null }
+
+  const anchorVmg = anchor.speed * Math.abs(Math.cos(anchor.twa))
+  const previousVmg = previous.speed * Math.abs(Math.cos(previous.twa))
+  const distanceToEnd = Math.PI - anchor.twa
+  const slope = Math.min(0, (anchorVmg - previousVmg) / (anchor.twa - previous.twa)) // VMG may never increase
+
+  return {
+    points: extended,
+    runFlatten: { anchorTwa: anchor.twa, anchorVmg, a: -slope / (2 * distanceToEnd), b: slope }
+  }
+}
+
+// Biggest axis-defined TWA (with real data) below the rounded run angle.
+function findReferenceAngle(axisPoints, runAngle) {
+  const roundedRunDeg = Math.round(runAngle * 180 / Math.PI)
+  let best = null
+  for (const point of axisPoints) {
+    const deg = Math.round(point.twa * 180 / Math.PI)
+    if (deg < roundedRunDeg && (best === null || point.twa > best)) best = point.twa
+  }
+  return best
 }
 
 function addTarget(points, target) {
@@ -252,50 +318,44 @@ function addExtrapolation(entry) {
       entry.beatExtrap = { a, b: slope - 2 * a * distance }
     }
   }
-  const runIndex = entry.points.findIndex(point => point.twa === entry.runAngle)
-  const previous = entry.points[runIndex - 1]
-  if (previous?.twa >= Math.PI / 2 && entry.runAngle - Math.PI / 2 > 1e-6) {
-    const runVmg = entry.points[runIndex].speed * Math.cos(entry.runAngle)
-    entry.runExtrap = {
-      runVmg,
-      omega: Math.PI / (2 * (entry.runAngle - Math.PI / 2)),
-      extrapLimit: Math.min(Math.PI, entry.points.at(-1).twa + (Math.PI - entry.runAngle) * RUN_EXTRAP_FACTOR)
-    }
-  }
 }
 
-function speedFromEntry(entry, twa) {
-  if (Number.isFinite(entry.beatAngle) && twa < entry.beatAngle) {
+function speedFromEntry(entry, twa, extrapolate) {
+  if (extrapolate && Number.isFinite(entry.beatAngle) && twa < entry.beatAngle) {
     if (!entry.beatExtrap || twa <= PINCH_ANGLE) return 0
     const distance = twa - PINCH_ANGLE
     return Math.max(0, entry.beatExtrap.a * distance * distance + entry.beatExtrap.b * distance)
   }
-  const last = entry.points.at(-1)
+  const points = extrapolate ? entry.points : entry.realPoints
+  const last = points.at(-1)
   if (twa > last.twa) {
-    if (!entry.runExtrap || twa > Math.PI) return null
-    const vmg = entry.runExtrap.runVmg * Math.cos(entry.runExtrap.omega * (twa - entry.runAngle))
-    const cosine = Math.cos(twa)
-    return Math.abs(cosine) < 1e-9 ? null : Math.max(0, vmg / cosine)
+    if (!extrapolate || !entry.runFlatten) return null
+    const x = twa - entry.runFlatten.anchorTwa
+    const vmg = Math.min(entry.runFlatten.anchorVmg, entry.runFlatten.anchorVmg + entry.runFlatten.b * x + entry.runFlatten.a * x * x)
+    const cosine = Math.abs(Math.cos(twa)) // vmg is a magnitude (see addRunExtension); keep the conversion sign-consistent
+    return cosine < EPSILON ? null : Math.max(0, vmg / cosine)
   }
   let lower = -1
   let upper = -1
-  for (let index = 0; index < entry.points.length; index += 1) {
-    if (entry.points[index].twa <= twa) lower = index
-    if (entry.points[index].twa >= twa && upper === -1) upper = index
+  for (let index = 0; index < points.length; index += 1) {
+    if (points[index].twa <= twa) lower = index
+    if (points[index].twa >= twa && upper === -1) upper = index
   }
   if (lower === -1) return null
-  if (upper === -1 || lower === upper) return entry.points[lower].speed
-  const low = entry.points[lower]
-  const high = entry.points[upper]
+  if (upper === -1 || lower === upper) return points[lower].speed
+  const low = points[lower]
+  const high = points[upper]
   return interpolate(low.speed, high.speed, (twa - low.twa) / (high.twa - low.twa))
 }
 
-function minTwaForEntry(entry) {
+function minTwaForEntry(entry, extrapolate) {
+  if (!extrapolate) return entry.realPoints[0].twa
   return entry.beatExtrap ? PINCH_FACTOR * entry.beatAngle : entry.points[0].twa
 }
 
-function maxTwaForEntry(entry) {
-  return entry.runExtrap?.extrapLimit ?? entry.points.at(-1).twa
+function maxTwaForEntry(entry, extrapolate) {
+  if (!extrapolate) return entry.realPoints.at(-1).twa
+  return entry.runFlatten ? Math.PI : entry.points.at(-1).twa
 }
 
 function fillDerivedTargets(twsAxis, rows) {
