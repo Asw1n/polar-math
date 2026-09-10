@@ -36,46 +36,55 @@ The performance factor is deliberately a per-query input.
 ## Interpolation and extrapolation
 
 Within a TWS row, a query angle that falls between two real points (measured axis columns, plus any
-`derived.rows` beat/run target inserted into the same list) is always **linearly interpolated** between
-them — this is genuine measured data, never a model. Between two TWS rows, results are linearly
-interpolated the same way. Only angles *outside* the real data span (below the beat angle, or beyond the
-last real point) fall back to a modeled extrapolation, described below.
+`derived.rows` beat/run target inserted into the same list) is interpolated using a **monotone cubic
+Hermite spline (PCHIP)** — smooth (continuous slope) and passing exactly through the real data, but with
+a built-in constraint that it can never overshoot or oscillate between two points the way a plain cubic
+spline can. Between two TWS rows, results are still linearly interpolated (TWS rows are few and widely
+spaced, and are never rendered as a continuous curve themselves, so the simpler method is preferred
+there). Only angles *outside* the real data span (below the beat angle, or beyond the last real point)
+fall back to the modeled extrapolation described below.
 
 ### Beat-side (pinching)
 
-Below the beat angle, speed is assumed to taper to zero at a fixed pinch angle (25°) using a quadratic fit
-matched to the beat point's value and local slope. `rangeAt`'s reported `minTwa` sits at 90% of the beat
-angle, a conservative boundary short of the full pinch angle. This model has not changed as part of the
-run-side work below.
+Below the beat angle, speed is assumed to taper to zero at a fixed pinch angle (25°). Rather than a
+separate formula, this is modeled as a single synthetic zero-speed point prepended at the pinch angle,
+which the same PCHIP fit above then interpolates through like any other point — below the pinch angle
+there is no plausible drive at all (the boat is in irons), so no further modeling is needed past that
+point. `rangeAt`'s reported `minTwa` still sits at 90% of the beat angle, a conservative boundary short of
+the full pinch angle.
 
 ### Run-side (gybe)
 
 The deepest real angle in a row is rarely 180° (dead downwind), but the polar plot is mirrored
-port/starboard at 180°, so a query (or a rendered curve) needs *something* defined all the way there. The
-run extension has two steps, both operating on **VMG** (`speed × |cos(twa)|`) rather than raw speed,
-because VMG — not speed — is the quantity that peaks at the run angle and is expected to behave
-predictably beyond it:
+port/starboard at 180°, so a query (or a rendered curve) needs *something* defined all the way there.
+Unlike the beat side, real sailing behaviour genuinely continues past the last known angle — so this side
+does need an extrapolated model, in two steps, both operating on **VMG** (`speed × |cos(twa)|`) rather
+than raw speed, because VMG — not speed — is the quantity that peaks at the run angle and is expected to
+behave predictably beyond it:
 
 1. **Mirror point.** The run angle is a peak: VMG rises up to it and falls beyond it. As a first
    extrapolated point, the model assumes the fall mirrors the rise — the VMG at
    `runAngle + d` is assumed equal to the VMG already measured at `runAngle - d`, where `d` is the
    distance back to the nearest real axis point below the run angle. This adds **at most one** synthetic
    point, and only when it would land beyond the last real point and at or before 180°; if real data
-   already reaches (or the mirror would overshoot) 180°, no mirror point is added.
+   already reaches (or the mirror would overshoot) 180°, no mirror point is added. This point also
+   becomes part of the PCHIP fit above, like any other point.
 2. **Taper to zero slope at 180°.** From the deepest known angle (the mirror point, or the last real
    point if no mirror was added), the VMG slope is assumed to decrease linearly to exactly zero at 180° —
    the point where the boat gybes and the polar mirrors onto itself, so VMG must be momentarily flat
-   there. Integrating that linear slope gives a quadratic VMG curve out to 180°, converted back to boat
-   speed at query time. Two safety clamps apply: speed is never negative, and VMG is never allowed to
-   increase past its value at the deepest known angle.
+   there. The starting slope for this taper is taken directly from the PCHIP tangent at that point
+   (converted from `dSpeed/dTWA` to `dVMG/dTWA`), so the taper connects smoothly to the interior curve
+   rather than starting from an independent estimate. Integrating that linear slope gives a quadratic VMG
+   curve out to 180°, converted back to boat speed at query time. Two safety clamps apply: speed is never
+   negative, and VMG is never allowed to increase past its value at the deepest known angle.
 
-Both steps are skipped if a row has no run target, too few points to establish a slope, or is already
-complete out to 180°.
+Both the mirror point and the taper are skipped if a row has no run target, too few points to establish a
+slope, or is already complete out to 180°.
 
 ### Opting out: `extrapolate: false`
 
 Every query method accepts `extrapolate` (default `true`). Pass `extrapolate: false` to restrict results to
-real data only — no beat-side pinch taper, no run-side mirror/taper. `rangeAt` then reports the TWA span
+real data only — no beat-side pinch point, no run-side mirror/taper. `rangeAt` then reports the TWA span
 actually covered by measured axis columns and derived targets, and `speedAt`/`vmgAt` return `value: null`
 (`state.twa: 'below_range'`/`'above_range'`) for anything outside it. Use this when extrapolated data
 would be misleading for the caller's purpose (e.g. feeding a live performance calculation) rather than

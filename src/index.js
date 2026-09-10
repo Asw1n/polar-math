@@ -204,8 +204,14 @@ function prepareEntries(table) {
     addTarget(points, target.run)
     points.sort((a, b) => a.twa - b.twa)
     const derived = deriveTargets(points, target)
-    const { points: extendedPoints, runFlatten } = addRunExtension(axisPoints, points, derived)
-    return [{ tws, points: extendedPoints, realPoints: points, runFlatten, ...derived }]
+    const realPoints = points.slice()
+
+    const extended = addRunExtension(axisPoints, addBeatExtension(points, derived), derived)
+    const tangents = pchipTangents(extended)
+    const realTangents = pchipTangents(realPoints)
+    const runFlatten = buildRunFlatten(extended, tangents, derived)
+
+    return [{ tws, points: extended, tangents, realPoints, realTangents, runFlatten, ...derived }]
   })
 
   if (entries.length === 0) return []
@@ -214,7 +220,9 @@ function prepareEntries(table) {
   entries.unshift({
     tws: 0.0001,
     points: first.points.map(point => ({ ...point, speed: 0 })),
+    tangents: first.tangents.map(() => 0),
     realPoints: first.realPoints.map(point => ({ ...point, speed: 0 })),
+    realTangents: first.realTangents.map(() => 0),
     runFlatten: first.runFlatten ? { ...first.runFlatten, anchorVmg: 0, a: 0, b: 0 } : null,
     beatAngle: first.beatAngle,
     beatSpeed: 0,
@@ -225,51 +233,67 @@ function prepareEntries(table) {
     maxSpeed: 0,
     maxSpeedAngle: first.maxSpeedAngle
   })
-  entries.forEach(addExtrapolation)
   return entries.map(entry => Object.freeze({
     ...entry,
     points: Object.freeze(entry.points.map(Object.freeze)),
-    realPoints: Object.freeze(entry.realPoints.map(Object.freeze))
+    realPoints: Object.freeze(entry.realPoints.map(Object.freeze)),
+    tangents: Object.freeze(entry.tangents),
+    realTangents: Object.freeze(entry.realTangents)
   }))
 }
 
+// Prepends a synthetic zero-speed anchor at the pinch angle so the same interior
+// (PCHIP) interpolation covers the beat-side taper -- no separate formula needed,
+// since below the pinch angle the boat genuinely has no drive (there is no
+// "real behaviour we're not modeling" the way there is on the run side).
+function addBeatExtension(points, derived) {
+  if (!Number.isFinite(derived.beatAngle) || derived.beatAngle <= PINCH_ANGLE) return points
+  if (points[0].twa <= PINCH_ANGLE + EPSILON) return points
+  return [{ twa: PINCH_ANGLE, speed: 0 }, ...points]
+}
+
 // Extends the run side of the curve with at most one mirrored point beyond the
-// deepest known angle, then a quadratic VMG taper to zero slope at 180deg.
-// See run-extrapolation design discussion (mirror point + VMG flattening) for rationale.
+// deepest known angle (see buildRunFlatten for the quadratic VMG taper to 180deg
+// that starts from this extended point list).
 function addRunExtension(axisPoints, points, derived) {
-  if (!Number.isFinite(derived.runAngle)) return { points, runFlatten: null }
+  if (!Number.isFinite(derived.runAngle)) return points
 
-  let extended = points
   const referenceAngle = findReferenceAngle(axisPoints, derived.runAngle)
-  if (referenceAngle !== null) {
-    let mirrorAngle = 2 * derived.runAngle - referenceAngle
-    if (Math.abs(mirrorAngle - Math.PI) < EPSILON) mirrorAngle = Math.PI // snap float noise onto the exact boundary
-    const maxKnownAngle = points.at(-1).twa
-    const mirrorCosine = Math.abs(Math.cos(mirrorAngle))
-    // Skip the mirror point entirely if its true (uncapped) position is beyond
-    // 180deg -- placing it clamped at pi would encode the wrong VMG right at the
-    // boundary and short-circuit the smooth taper below.
-    if (mirrorAngle <= Math.PI && mirrorAngle > maxKnownAngle + EPSILON && mirrorCosine > EPSILON) {
-      const reference = axisPoints.find(point => point.twa === referenceAngle)
-      const referenceVmg = reference.speed * Math.abs(Math.cos(reference.twa))
-      const mirrorSpeed = Math.max(0, referenceVmg / mirrorCosine)
-      extended = [...points, { twa: mirrorAngle, speed: mirrorSpeed }].sort((a, b) => a.twa - b.twa)
-    }
-  }
+  if (referenceAngle === null) return points
 
-  const anchor = extended.at(-1)
-  const previous = extended.at(-2)
-  if (!previous || anchor.twa >= Math.PI - EPSILON) return { points: extended, runFlatten: null }
+  let mirrorAngle = 2 * derived.runAngle - referenceAngle
+  if (Math.abs(mirrorAngle - Math.PI) < EPSILON) mirrorAngle = Math.PI // snap float noise onto the exact boundary
+  const maxKnownAngle = points.at(-1).twa
+  const mirrorCosine = Math.abs(Math.cos(mirrorAngle))
+  // Skip the mirror point entirely if its true (uncapped) position is beyond
+  // 180deg -- placing it clamped at pi would encode the wrong VMG right at the
+  // boundary and short-circuit the smooth taper below.
+  if (mirrorAngle > Math.PI || mirrorAngle <= maxKnownAngle + EPSILON || mirrorCosine <= EPSILON) return points
+
+  const reference = axisPoints.find(point => point.twa === referenceAngle)
+  const referenceVmg = reference.speed * Math.abs(Math.cos(reference.twa))
+  const mirrorSpeed = Math.max(0, referenceVmg / mirrorCosine)
+  return [...points, { twa: mirrorAngle, speed: mirrorSpeed }].sort((a, b) => a.twa - b.twa)
+}
+
+// Quadratic VMG taper from the deepest known point (mirror point, or the last
+// real point if no mirror was added) to zero VMG slope at 180deg. The initial
+// slope comes from the PCHIP tangent at that point (dSpeed/dTWA), converted to
+// dVMG/dTWA via the product rule so the taper is slope-continuous with the
+// interior curve rather than restarting from a separate secant estimate.
+function buildRunFlatten(points, tangents, derived) {
+  if (!Number.isFinite(derived.runAngle)) return null
+  const anchor = points.at(-1)
+  if (points.length < 2 || anchor.twa >= Math.PI - EPSILON) return null
 
   const anchorVmg = anchor.speed * Math.abs(Math.cos(anchor.twa))
-  const previousVmg = previous.speed * Math.abs(Math.cos(previous.twa))
+  const speedSlope = tangents.at(-1)
+  // VMG magnitude = -speed*cos(twa) for twa in (pi/2, pi]; differentiate via the product rule.
+  let slope = -speedSlope * Math.cos(anchor.twa) + anchor.speed * Math.sin(anchor.twa)
+  slope = Math.min(0, slope) // VMG may never increase
   const distanceToEnd = Math.PI - anchor.twa
-  const slope = Math.min(0, (anchorVmg - previousVmg) / (anchor.twa - previous.twa)) // VMG may never increase
 
-  return {
-    points: extended,
-    runFlatten: { anchorTwa: anchor.twa, anchorVmg, a: -slope / (2 * distanceToEnd), b: slope }
-  }
+  return { anchorTwa: anchor.twa, anchorVmg, a: -slope / (2 * distanceToEnd), b: slope }
 }
 
 // Biggest axis-defined TWA (with real data) below the rounded run angle.
@@ -281,6 +305,74 @@ function findReferenceAngle(axisPoints, runAngle) {
     if (deg < roundedRunDeg && (best === null || point.twa > best)) best = point.twa
   }
   return best
+}
+
+// Fritsch-Carlson monotone cubic Hermite (PCHIP) tangents for a sorted point list.
+// Interior tangents use a weighted harmonic mean of the two adjacent secants (zero
+// at local extrema, so the curve never overshoots between real points); endpoint
+// tangents use the standard one-sided three-point estimate with the same
+// shape-preserving clamp.
+function pchipTangents(points) {
+  const n = points.length
+  const tangents = new Array(n).fill(0)
+  if (n < 2) return tangents
+
+  const h = []
+  const m = []
+  for (let i = 0; i < n - 1; i += 1) {
+    h.push(points[i + 1].twa - points[i].twa)
+    m.push((points[i + 1].speed - points[i].speed) / h[i])
+  }
+
+  if (n === 2) {
+    tangents[0] = m[0]
+    tangents[1] = m[0]
+    return tangents
+  }
+
+  for (let i = 1; i < n - 1; i += 1) {
+    if (m[i - 1] === 0 || m[i] === 0 || (m[i - 1] > 0) !== (m[i] > 0)) {
+      tangents[i] = 0
+    } else {
+      const w1 = 2 * h[i] + h[i - 1]
+      const w2 = h[i] + 2 * h[i - 1]
+      tangents[i] = (w1 + w2) / (w1 / m[i - 1] + w2 / m[i])
+    }
+  }
+  tangents[0] = pchipEndpointTangent(h[0], h[1], m[0], m[1])
+  tangents[n - 1] = pchipEndpointTangent(h[n - 2], h[n - 3], m[n - 2], m[n - 3])
+  return tangents
+}
+
+function pchipEndpointTangent(h0, h1, m0, m1) {
+  let tangent = ((2 * h0 + h1) * m0 - h0 * m1) / (h0 + h1)
+  if (tangent !== 0 && m0 !== 0 && (tangent > 0) !== (m0 > 0)) tangent = 0
+  else if (m0 !== 0 && m1 !== 0 && (m0 > 0) !== (m1 > 0) && Math.abs(tangent) > Math.abs(3 * m0)) tangent = 3 * m0
+  return tangent
+}
+
+// Evaluates the monotone cubic Hermite curve at twa; null below the first point.
+function evaluatePchip(points, tangents, twa) {
+  if (twa < points[0].twa) return null
+  if (points.length === 1) return twa === points[0].twa ? points[0].speed : null
+
+  let index = 0
+  for (let i = 0; i < points.length - 1; i += 1) {
+    if (points[i].twa <= twa) index = i
+  }
+  if (index === points.length - 1) return points[index].speed
+
+  const p0 = points[index]
+  const p1 = points[index + 1]
+  const h = p1.twa - p0.twa
+  const t = (twa - p0.twa) / h
+  const t2 = t * t
+  const t3 = t2 * t
+  const h00 = 2 * t3 - 3 * t2 + 1
+  const h10 = t3 - 2 * t2 + t
+  const h01 = -2 * t3 + 3 * t2
+  const h11 = t3 - t2
+  return Math.max(0, h00 * p0.speed + h10 * h * tangents[index] + h01 * p1.speed + h11 * h * tangents[index + 1])
 }
 
 function addTarget(points, target) {
@@ -306,51 +398,24 @@ function deriveTargets(points, target) {
   }
 }
 
-function addExtrapolation(entry) {
-  const beatIndex = entry.points.findIndex(point => point.twa === entry.beatAngle)
-  if (entry.beatAngle > PINCH_ANGLE && beatIndex >= 0) {
-    const beat = entry.points[beatIndex]
-    const next = entry.points[beatIndex + 1]
-    if (next?.twa < Math.PI / 2) {
-      const slope = (next.speed - beat.speed) / (next.twa - beat.twa)
-      const distance = entry.beatAngle - PINCH_ANGLE
-      const a = (slope * distance - beat.speed) / (distance * distance)
-      entry.beatExtrap = { a, b: slope - 2 * a * distance }
-    }
-  }
-}
-
 function speedFromEntry(entry, twa, extrapolate) {
-  if (extrapolate && Number.isFinite(entry.beatAngle) && twa < entry.beatAngle) {
-    if (!entry.beatExtrap || twa <= PINCH_ANGLE) return 0
-    const distance = twa - PINCH_ANGLE
-    return Math.max(0, entry.beatExtrap.a * distance * distance + entry.beatExtrap.b * distance)
-  }
   const points = extrapolate ? entry.points : entry.realPoints
+  const tangents = extrapolate ? entry.tangents : entry.realTangents
   const last = points.at(-1)
   if (twa > last.twa) {
     if (!extrapolate || !entry.runFlatten) return null
     const x = twa - entry.runFlatten.anchorTwa
     const vmg = Math.min(entry.runFlatten.anchorVmg, entry.runFlatten.anchorVmg + entry.runFlatten.b * x + entry.runFlatten.a * x * x)
-    const cosine = Math.abs(Math.cos(twa)) // vmg is a magnitude (see addRunExtension); keep the conversion sign-consistent
+    const cosine = Math.abs(Math.cos(twa)) // vmg is a magnitude (see buildRunFlatten); keep the conversion sign-consistent
     return cosine < EPSILON ? null : Math.max(0, vmg / cosine)
   }
-  let lower = -1
-  let upper = -1
-  for (let index = 0; index < points.length; index += 1) {
-    if (points[index].twa <= twa) lower = index
-    if (points[index].twa >= twa && upper === -1) upper = index
-  }
-  if (lower === -1) return null
-  if (upper === -1 || lower === upper) return points[lower].speed
-  const low = points[lower]
-  const high = points[upper]
-  return interpolate(low.speed, high.speed, (twa - low.twa) / (high.twa - low.twa))
+  return evaluatePchip(points, tangents, twa)
 }
 
 function minTwaForEntry(entry, extrapolate) {
   if (!extrapolate) return entry.realPoints[0].twa
-  return entry.beatExtrap ? PINCH_FACTOR * entry.beatAngle : entry.points[0].twa
+  const first = entry.points[0]
+  return first.twa <= PINCH_ANGLE + EPSILON ? PINCH_FACTOR * entry.beatAngle : first.twa
 }
 
 function maxTwaForEntry(entry, extrapolate) {
