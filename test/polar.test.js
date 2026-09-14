@@ -89,6 +89,12 @@ describe('Polar', () => {
     assert.ok(closeTo(polar.targetsAt({ tws: 12 * KNOTS, performanceFactor: 0.9 }).value.beat.speed, 5.84 * KNOTS * 0.9))
   })
 
+  it('defaults the performance factor to 1.0', () => {
+    const omitted = polar.speedAt({ tws: 12 * KNOTS, twa: radians(90) })
+    const explicit = polar.speedAt({ tws: 12 * KNOTS, twa: radians(90), performanceFactor: 1.0 })
+    assert.equal(omitted.value, explicit.value)
+  })
+
   it('returns unavailable state for invalid numeric query input', () => {
     const result = polar.vmgAt({ tws: NaN, twa: radians(60) })
     assert.deepEqual(result, { value: null, state: { available: false, reason: 'invalid_input', tws: null, twa: null } })

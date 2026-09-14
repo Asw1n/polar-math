@@ -16,6 +16,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) 
 - Replaced the run-side (gybe) cosine extrapolation with a mirror-point + VMG-taper model: a single point
   mirrors the measured VMG rise around the run angle, then VMG slope is tapered linearly to zero at 180deg.
   This reliably reaches 180deg and is slope-continuous with the real data, unlike the previous model.
+- The default performance factor is `1.0`, so queries without an explicit factor use the unadjusted polar values.
 
 ## 1.0.1 - 2026-09-10
 

@@ -5,6 +5,7 @@ const { validatePolarTable } = require('polar-format')
 const PINCH_FACTOR = 0.9
 const PINCH_ANGLE = 25 * Math.PI / 180
 const EPSILON = 1e-9
+const DEFAULT_PERFORMANCE_FACTOR = 1.0
 
 function validState(tws, twa = null) {
   return { available: true, tws, twa }
@@ -19,7 +20,7 @@ function noDataState() {
 }
 
 function queryOptions(options, requireTwa) {
-  const { tws, twa, performanceFactor = 1, extrapolate = true } = options || {}
+  const { tws, twa, performanceFactor = DEFAULT_PERFORMANCE_FACTOR, extrapolate = true } = options || {}
   if (!Number.isFinite(tws) || !Number.isFinite(performanceFactor) || performanceFactor < 0 ||
       (requireTwa && (!Number.isFinite(twa) || Math.abs(twa) > Math.PI))) return null
   return { tws, twa, performanceFactor, extrapolate: extrapolate !== false }

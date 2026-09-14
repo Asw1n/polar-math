@@ -9,9 +9,9 @@ their dynamic inputs explicitly and return `{ value, state }`. Measurements use 
 const { Polar } = require('polar-math')
 
 const polar = Polar.fromTable(table)
-const speed = polar.speedAt({ tws, twa, performanceFactor: 0.95 })
-const vmg = polar.vmgAt({ tws, twa, performanceFactor: 0.95 })
-const targets = polar.targetsAt({ tws, performanceFactor: 0.95 })
+const speed = polar.speedAt({ tws, twa, performanceFactor: 1.0 })
+const vmg = polar.vmgAt({ tws, twa, performanceFactor: 1.0 })
+const targets = polar.targetsAt({ tws, performanceFactor: 1.0 })
 const range = polar.rangeAt({ tws })
 ```
 
@@ -31,7 +31,8 @@ returns `value: null` and `state.reason: 'invalid_input'`.
 - `extrapolated` — beyond the table's last real TWA point but within the modeled run extension
 - `above_range` — beyond the modeled range; `speedAt`/`vmgAt` return `value: null`
 
-The performance factor is deliberately a per-query input.
+The performance factor is deliberately a per-query input and defaults to `1.0`, meaning the polar's
+unadjusted performance. Values below `1.0` scale the calculated speed and target values down.
 
 ## Interpolation and extrapolation
 
