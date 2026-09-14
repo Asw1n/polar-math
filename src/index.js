@@ -2,8 +2,8 @@
 
 const { validatePolarTable } = require('polar-format')
 
-const PINCH_FACTOR = 0.9
-const PINCH_ANGLE = 25 * Math.PI / 180
+const PINCH_FACTOR = 0.8
+const BEAT_ENDPOINT_ANGLE = 25 * Math.PI / 180
 const EPSILON = 1e-9
 const DEFAULT_PERFORMANCE_FACTOR = 1.0
 
@@ -243,14 +243,12 @@ function prepareEntries(table) {
   }))
 }
 
-// Prepends a synthetic zero-speed anchor at the pinch angle so the same interior
-// (PCHIP) interpolation covers the beat-side taper -- no separate formula needed,
-// since below the pinch angle the boat genuinely has no drive (there is no
-// "real behaviour we're not modeling" the way there is on the run side).
+// Prepends a synthetic zero-speed endpoint so the PCHIP curve reaches 25deg on
+// the beat side without using the query cutoff to shape the curve.
 function addBeatExtension(points, derived) {
-  if (!Number.isFinite(derived.beatAngle) || derived.beatAngle <= PINCH_ANGLE) return points
-  if (points[0].twa <= PINCH_ANGLE + EPSILON) return points
-  return [{ twa: PINCH_ANGLE, speed: 0 }, ...points]
+  if (!Number.isFinite(derived.beatAngle) || derived.beatAngle <= BEAT_ENDPOINT_ANGLE) return points
+  if (points[0].twa <= BEAT_ENDPOINT_ANGLE + EPSILON) return points
+  return [{ twa: BEAT_ENDPOINT_ANGLE, speed: 0 }, ...points]
 }
 
 // Extends the run side of the curve with at most one mirrored point beyond the
@@ -415,8 +413,9 @@ function speedFromEntry(entry, twa, extrapolate) {
 
 function minTwaForEntry(entry, extrapolate) {
   if (!extrapolate) return entry.realPoints[0].twa
-  const first = entry.points[0]
-  return first.twa <= PINCH_ANGLE + EPSILON ? PINCH_FACTOR * entry.beatAngle : first.twa
+  return Number.isFinite(entry.beatAngle)
+    ? BEAT_ENDPOINT_ANGLE + PINCH_FACTOR * (entry.beatAngle - BEAT_ENDPOINT_ANGLE)
+    : entry.points[0].twa
 }
 
 function maxTwaForEntry(entry, extrapolate) {

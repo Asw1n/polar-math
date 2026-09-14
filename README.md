@@ -38,21 +38,29 @@ unadjusted performance. Values below `1.0` scale the calculated speed and target
 
 Within a TWS row, a query angle that falls between two real points (measured axis columns, plus any
 `derived.rows` beat/run target inserted into the same list) is interpolated using a **monotone cubic
-Hermite spline (PCHIP)** — smooth (continuous slope) and passing exactly through the real data, but with
+Hermite spline (PCHIP)** — smooth (continuous slope) and passing exactly through the input and synthetic
+curve points, but with
 a built-in constraint that it can never overshoot or oscillate between two points the way a plain cubic
 spline can. Between two TWS rows, results are still linearly interpolated (TWS rows are few and widely
 spaced, and are never rendered as a continuous curve themselves, so the simpler method is preferred
-there). Only angles *outside* the real data span (below the beat angle, or beyond the last real point)
+there). Angles *outside* the real data span (below the beat angle, or beyond the last real point)
 fall back to the modeled extrapolation described below.
 
 ### Beat-side (pinching)
 
-Below the beat angle, speed is assumed to taper to zero at a fixed pinch angle (25°). Rather than a
-separate formula, this is modeled as a single synthetic zero-speed point prepended at the pinch angle,
-which the same PCHIP fit above then interpolates through like any other point — below the pinch angle
-there is no plausible drive at all (the boat is in irons), so no further modeling is needed past that
-point. `rangeAt`'s reported `minTwa` still sits at 90% of the beat angle, a conservative boundary short of
-the full pinch angle.
+Below the beat angle, speed is modeled down to a fixed 25° endpoint. A synthetic zero-speed point is
+prepended at 25°, and the same PCHIP fit above interpolates through it like any other curve point. This
+endpoint is part of the curve construction and is independent of the pinch cutoff. `rangeAt`'s reported
+`minTwa` is the endpoint plus `PINCH_FACTOR` (currently `0.8`) of the angular distance from that endpoint
+to the beat angle:
+
+```text
+minTwa = 25° + 0.8 × (beatAngle - 25°)
+```
+
+Queries below this boundary are classified as `in_irons` and return `value: null`; the boundary does not
+alter the PCHIP curve. The 25° endpoint is only added when a valid beat target exists and the row's first
+point is above 25°.
 
 ### Run-side (gybe)
 
@@ -85,7 +93,7 @@ slope, or is already complete out to 180°.
 ### Opting out: `extrapolate: false`
 
 Every query method accepts `extrapolate` (default `true`). Pass `extrapolate: false` to restrict results to
-real data only — no beat-side pinch point, no run-side mirror/taper. `rangeAt` then reports the TWA span
+real data only — no beat-side 25° endpoint, no run-side mirror/taper. `rangeAt` then reports the TWA span
 actually covered by measured axis columns and derived targets, and `speedAt`/`vmgAt` return `value: null`
 (`state.twa: 'below_range'`/`'above_range'`) for anything outside it. Use this when extrapolated data
 would be misleading for the caller's purpose (e.g. feeding a live performance calculation) rather than
