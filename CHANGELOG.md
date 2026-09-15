@@ -3,6 +3,14 @@
 All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 1.1.1 - 2026-09-15
+
+### Fixed
+
+- Defined the beat-side pinch cutoff (reported as `rangeAt`'s `minTwa`) relative to the 25° curve
+  endpoint rather than the query cutoff itself, so the cutoff no longer shapes the PCHIP curve it is
+  derived from.
+
 ## 1.1.0 - 2026-09-10
 
 ### Added
