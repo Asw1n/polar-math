@@ -2,6 +2,11 @@
 
 Pure calculations for canonical `polar-format` polar tables. The package has no Signal K dependency.
 
+The [version-2 API specification](docs/polar-v2-api-specification.md) records the
+agreed design for upcoming polar-set support, auxiliary queries and wave-adjusted
+targets. It is an implementation specification, not a description of currently
+available functionality.
+
 `Polar.fromTable(table)` validates and prepares an immutable polar table once. All query methods accept
 their dynamic inputs explicitly and return `{ value, state }`. Measurements use SI units: m/s and radians.
 
