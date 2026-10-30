@@ -16,19 +16,21 @@
   },
   "files": [
     "src/",
+    "docs/",
     "README.md",
     "CHANGELOG.md",
     "LICENSE"
   ],
   "scripts": {
     "test": "node --test test/**/*.test.js",
+    "benchmark": "node benchmark/routing.js",
     "prepublishOnly": "npm test"
   },
   "engines": {
     "node": ">=20"
   },
   "dependencies": {
-    "polar-format": "^1.0.0"
+    "polar-format": "^2.0.0"
   },
   "repository": {
     "type": "git",

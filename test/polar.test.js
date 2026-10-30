@@ -35,8 +35,8 @@ const sparseTable = (speeds, twa = [40, 60, 80, 100, 120, 150, 180]) => ({
   kind: 'polarTable', schemaVersion: '1.0.0', name: 'Sparse Polar',
   units: { tws: 'm/s', twa: 'rad', boatSpeed: 'm/s' },
   symmetry: { portStarboardSymmetric: true },
-  axes: { tws: [10 * KNOTS], twa: twa.map(radians) },
-  values: { boatSpeedMatrix: [speeds.map(knots => knots * KNOTS)] }
+  axes: { tws: [10 * KNOTS], twa: twa.filter((_, index) => speeds[index] !== 0).map(radians) },
+  values: { boatSpeedMatrix: [speeds.filter(speed => speed !== 0).map(knots => knots * KNOTS)] }
 })
 
 describe('Polar', () => {
@@ -47,7 +47,10 @@ describe('Polar', () => {
   it('interpolates speed and returns its range state', () => {
     const result = polar.speedAt({ tws: 12 * KNOTS, twa: radians(90) })
     assert.ok(closeTo(result.value, 6.82 * KNOTS))
-    assert.deepEqual(result.state, { available: true, tws: 'in_range', twa: 'in_range' })
+    assert.deepEqual(result.state, {
+      available: true, tws: 'in_range', twa: 'in_range',
+      waveCorrection: { applied: false, reason: 'not_requested' }
+    })
   })
 
   it('keeps port and starboard speed symmetric', () => {
@@ -150,7 +153,7 @@ describe('Polar', () => {
     assert.equal(sparse.speedAt({ tws: 10 * KNOTS, twa: radians(110) }).value, null)
   })
 
-  it('skips empty rows while retaining sane interpolation and TWS state', () => {
+  it('preserves supplied zero-speed rows and their TWS state', () => {
     const table = sparseTable([4, 5, 5.5, 5, 4.5, 4, 3])
     table.axes.tws = [10 * KNOTS, 20 * KNOTS, 30 * KNOTS]
     table.values.boatSpeedMatrix = [
@@ -161,21 +164,16 @@ describe('Polar', () => {
     const sparse = Polar.fromTable(table)
     const result = sparse.speedAt({ tws: 20 * KNOTS, twa: radians(80) })
 
-    assert.ok(Number.isFinite(result.value) && result.value > 0)
+    assert.equal(result.value, 0)
     assert.equal(result.state.tws, 'in_range')
   })
 
-  it('returns a deliberate unavailable state when every row is empty', () => {
-    const sparse = Polar.fromTable(sparseTable([0, 0, 0, 0, 0, 0, 0]))
-
-    assert.deepEqual(sparse.speedAt({ tws: 10 * KNOTS, twa: radians(100) }), {
-      value: null,
-      state: { available: false, reason: 'no_data', tws: null, twa: null }
-    })
-    assert.deepEqual(sparse.targetsAt({ tws: 10 * KNOTS }), {
-      value: null,
-      state: { available: false, reason: 'no_data', tws: null, twa: null }
-    })
+  it('treats a v1 zero as a numeric observation, not missing data', () => {
+    const table = sparseTable([4, 5], [60, 100])
+    table.values.boatSpeedMatrix = [[0, 0]]
+    const sparse = Polar.fromTable(table)
+    assert.equal(sparse.speedAt({ tws: 10 * KNOTS, twa: radians(100) }).value, 0)
+    assert.equal(sparse.targetsAt({ tws: 10 * KNOTS }).value.maxSpeed.speed, 0)
   })
 
   describe('run-side (gybe) extrapolation beyond the deepest known angle', () => {

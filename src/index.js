@@ -1,11 +1,14 @@
 'use strict'
 
-const { validatePolarTable } = require('polar-format')
+const { validatePolarTable, validatePolar } = require('polar-format')
+const { bracket, validSeaState, correction, waveFactor, bowSeaState } = require('./waves')
 
 const PINCH_FACTOR = 0.8
 const BEAT_ENDPOINT_ANGLE = 25 * Math.PI / 180
 const EPSILON = 1e-9
 const DEFAULT_PERFORMANCE_FACTOR = 1.0
+const AUXILIARIES = ['heel', 'reef', 'flat']
+const TARGETS = ['beat', 'run', 'maxSpeed']
 
 function validState(tws, twa = null) {
   return { available: true, tws, twa }
@@ -34,6 +37,46 @@ function roundToTwoDecimals(value) {
   return Math.round(value * 100) / 100
 }
 
+function deepFreeze(value) {
+  if (!value || typeof value !== 'object') return value
+  for (const child of Object.values(value)) deepFreeze(child)
+  return Object.freeze(value)
+}
+
+function findInterpolation(entries, tws) {
+  const axis = entries.map(entry => entry.tws)
+  const bounded = Math.max(axis[0], Math.min(axis.at(-1), tws))
+  const { lower, upper, ratio } = bracket(axis, bounded)
+  return { lowerIndex: lower, upperIndex: upper, ratio }
+}
+
+function axisState(entries, tws) {
+  if (tws < entries[0].tws) return 'below_range'
+  if (tws > entries.at(-1).tws) return 'above_range'
+  return 'in_range'
+}
+
+function prepareAuxiliaries(table, row) {
+  return Object.fromEntries(AUXILIARIES.map(name => [
+    name,
+    table.axes.twa.map((twa, col) => ({ twa, value: table.values[`${name}Matrix`]?.[row]?.[col] }))
+      .filter(point => Number.isFinite(point.value))
+  ]))
+}
+
+function sampleLinear(points, twa) {
+  if (!points.length) return null
+  const indices = bracket(points.map(point => point.twa), twa)
+  if (!indices) return null
+  return interpolate(points[indices.lower].value, points[indices.upper].value, indices.ratio)
+}
+
+function interpolateAuxiliaries(lower, upper, ratio) {
+  return Object.fromEntries(AUXILIARIES.map(name => [
+    name, lower[name] === null || upper[name] === null ? null : interpolate(lower[name], upper[name], ratio)
+  ]))
+}
+
 class Polar {
   static fromTable(table) {
     const validation = validatePolarTable(table)
@@ -43,23 +86,50 @@ class Polar {
     return new Polar(table)
   }
 
-  constructor(table) {
-    // validatePolarTable requires symmetry.portStarboardSymmetric === true; queries below rely on that
-    // and always mirror speed across the beam (Math.abs(twa)). There is no asymmetric-table support yet.
+  static fromPolarSet(set, sailplanId) {
+    const validation = validatePolar(set)
+    if (!validation.valid || set.schemaVersion !== '2.0.0') {
+      const details = validation.errors.map(error => `${error.path} ${error.message}`).join('; ')
+      throw new TypeError(`Invalid polar set: ${details || 'expected version 2.0.0 polarSet'}`)
+    }
+    const table = sailplanId === undefined ? set.best : set.sailplans?.find(plan => plan.id === sailplanId)?.table
+    if (!table) throw new TypeError(`Unknown polar sailplan ID: ${String(sailplanId)}`)
+    return new Polar(table, set)
+  }
+
+  constructor(table, context = table) {
+    // Both loaders validate symmetric root context; queries mirror signed TWA.
     this.entries = prepareEntries(table)
-    Object.freeze(this.entries)
+    this.auxiliaryEntries = table.axes.tws.map((tws, row) => ({
+      tws, ...prepareAuxiliaries(table, row)
+    }))
+    this.context = { units: context.units, symmetry: context.symmetry, waveCorrection: context.waveCorrection }
+    this.context = structuredClone(this.context)
+    deepFreeze(this)
   }
 
   speedAt(options) {
     const input = queryOptions(options, true)
-    if (!input) return { value: null, state: invalidState() }
+    if (!input || (options?.seaState !== undefined && !validSeaState(options.seaState))) {
+      return { value: null, state: invalidState() }
+    }
+    const wave = options?.seaState === undefined
+      ? { value: 1, correction: correction('not_requested') }
+      : waveFactor(this.context.waveCorrection, options.seaState)
+    const result = this.baselineSpeedAt(input)
+    result.state.waveCorrection = wave.correction
+    if (result.value !== null) result.value *= wave.value
+    return result
+  }
+
+  baselineSpeedAt(input) {
     if (this.entries.length === 0) return { value: null, state: noDataState() }
 
     const { tws, twa, performanceFactor, extrapolate } = input
     const interpolation = this.findTwsInterpolation(tws)
     const state = this.stateAt(tws, twa, extrapolate, interpolation)
     if (state.twa === 'below_range' || state.twa === 'in_irons' || state.twa === 'above_range') {
-      return { value: null, state }
+      return { value: null, state: { ...state, available: false, reason: 'no_data' } }
     }
 
     const lower = this.entries[interpolation.lowerIndex]
@@ -67,7 +137,9 @@ class Polar {
     const normalizedTwa = Math.abs(twa)
     const lowerSpeed = speedFromEntry(lower, normalizedTwa, extrapolate)
     const upperSpeed = speedFromEntry(upper, normalizedTwa, extrapolate)
-    if (lowerSpeed === null || upperSpeed === null) return { value: null, state }
+    if (lowerSpeed === null || upperSpeed === null) {
+      return { value: null, state: { ...state, available: false, reason: 'no_data' } }
+    }
 
     return { value: interpolate(lowerSpeed, upperSpeed, interpolation.ratio) * performanceFactor, state }
   }
@@ -76,13 +148,18 @@ class Polar {
     const input = queryOptions(options, true)
     if (!input) return { value: null, state: invalidState() }
 
-    const speed = this.speedAt(input)
+    const speed = this.speedAt(options)
     return { value: speed.value === null ? null : speed.value * Math.cos(input.twa), state: speed.state }
   }
 
   targetsAt(options) {
     const input = queryOptions(options, false)
-    if (!input) return { value: null, state: invalidState() }
+    const { seaState, tack = 'starboard', optimizationBudget = 0 } = options || {}
+    if (!input || !['starboard', 'port'].includes(tack) ||
+        !Number.isInteger(optimizationBudget) || optimizationBudget < 0 ||
+        (seaState !== undefined && !validSeaState(seaState, true))) {
+      return { value: null, state: invalidState() }
+    }
     if (this.entries.length === 0) return { value: null, state: noDataState() }
 
     const interpolation = this.findTwsInterpolation(input.tws)
@@ -90,7 +167,6 @@ class Polar {
     const upper = this.entries[interpolation.upperIndex]
     const scale = input.performanceFactor
     const target = (key) => interpolate(lower[key], upper[key], interpolation.ratio)
-    const maxSpeed = target('maxSpeed') * scale
     const sideTarget = (name) => {
       const angleKey = `${name}Angle`
       const speedKey = `${name}Speed`
@@ -99,18 +175,133 @@ class Polar {
       return {
         twa: target(angleKey),
         speed: target(speedKey) * scale,
-        vmg: target(vmgKey) * scale
+        vmg: target(vmgKey) * scale,
+        ...interpolateAuxiliaries(lower.targetAux[name], upper.targetAux[name], interpolation.ratio)
       }
     }
 
-    return {
-      value: {
-        beat: sideTarget('beat'),
-        run: sideTarget('run'),
-        maxSpeed: { twa: target('maxSpeedAngle'), speed: maxSpeed }
-      },
-      state: validState(this.twsState(input.tws), null)
+    const value = {
+      beat: sideTarget('beat'),
+      run: sideTarget('run'),
+      maxSpeed: {
+        twa: target('maxSpeedAngle'), speed: target('maxSpeed') * scale,
+        ...interpolateAuxiliaries(lower.targetAux.maxSpeed, upper.targetAux.maxSpeed, interpolation.ratio)
+      }
     }
+    const state = validState(this.twsState(input.tws), null)
+    state.waveCorrection = {}
+    state.optimization = {}
+    for (const name of TARGETS) {
+      let reason = seaState === undefined ? 'not_requested' : !this.context.waveCorrection ? 'no_model' : 'out_of_range'
+      let status = optimizationBudget === 0 ? 'not_requested' : 'not_applicable'
+      let evaluations = 0
+      if (!value[name]) status = 'unavailable'
+      else if (seaState !== undefined && this.context.waveCorrection) {
+        if (optimizationBudget > 0) {
+          const searched = this.searchTarget(name, value[name], input, seaState, tack, optimizationBudget)
+          evaluations = searched.evaluations
+          status = searched.status
+          if (searched.target) {
+            value[name] = searched.target
+            reason = null
+          }
+        } else {
+          const wave = waveFactor(this.context.waveCorrection, bowSeaState(seaState, value[name].twa, tack))
+          reason = wave.correction.reason
+          if (wave.correction.applied) {
+            value[name].speed *= wave.value
+            if (name !== 'maxSpeed') value[name].vmg = value[name].speed * Math.abs(Math.cos(value[name].twa))
+          }
+        }
+      }
+      state.waveCorrection[name] = correction(reason)
+      state.optimization[name] = { status, evaluations }
+    }
+    return { value, state }
+  }
+
+  searchTarget(name, baseline, input, seaState, tack, budget) {
+    const range = this.rangeAt(input).value
+    if (!range) return { target: null, status: 'unavailable', evaluations: 0 }
+    const min = name === 'run' ? Math.max(range.minTwa, Math.PI / 2) : range.minTwa
+    const max = name === 'beat' ? Math.min(range.maxTwa, Math.PI / 2) : range.maxTwa
+    if (min > max) return { target: null, status: 'unavailable', evaluations: 0 }
+    let best = null
+    let score = -Infinity
+    let evaluations = 0
+    // Breadth-first interval bisection visits multiple regions before refinement.
+    const queue = [[min, max]]
+    const seen = new Set()
+    const evaluate = twa => {
+      if (twa < min || twa > max || seen.has(twa) || evaluations >= budget) return
+      seen.add(twa)
+      evaluations += 1
+      const wave = waveFactor(this.context.waveCorrection, bowSeaState(seaState, twa, tack))
+      if (!wave.correction.applied) return
+      const speed = this.baselineSpeedAt({ ...input, twa }).value
+      if (speed === null) return
+      const correctedSpeed = speed * wave.value
+      const vmg = correctedSpeed * Math.abs(Math.cos(twa))
+      const candidateScore = name === 'maxSpeed' ? correctedSpeed : vmg
+      if (candidateScore > score) {
+        score = candidateScore
+        best = { twa, speed: correctedSpeed, ...(name === 'maxSpeed' ? {} : { vmg }) }
+      }
+    }
+    evaluate(baseline.twa)
+    evaluate(min)
+    evaluate(max)
+    let cursor = 0
+    while (evaluations < budget && cursor < queue.length) {
+      const [left, right] = queue[cursor++]
+      const middle = (left + right) / 2
+      evaluate(middle)
+      if (right - left > 1e-5 && middle !== left && middle !== right) {
+        queue.push([left, middle], [middle, right])
+      }
+    }
+    if (best) {
+      Object.assign(best, best.twa === baseline.twa
+        ? Object.fromEntries(AUXILIARIES.map(name => [name, baseline[name]]))
+        : this.auxiliariesAt(input.tws, best.twa))
+    }
+    return {
+      target: best, evaluations,
+      status: !best ? 'not_applicable' : cursor === queue.length ? 'converged' : 'budget_exhausted'
+    }
+  }
+
+  waveFactorAt(options) {
+    if (!validSeaState(options)) return { value: null, state: invalidState() }
+    const wave = waveFactor(this.context.waveCorrection, options)
+    return { value: wave.value, state: { ...validState(null), waveCorrection: wave.correction } }
+  }
+
+  heelAt(options) { return this.auxiliaryAt('heel', options) }
+  reefAt(options) { return this.auxiliaryAt('reef', options) }
+  flatAt(options) { return this.auxiliaryAt('flat', options) }
+
+  auxiliaryAt(name, options) {
+    const input = queryOptions(options, true)
+    if (!input) return { value: null, state: invalidState() }
+    const { lowerIndex, upperIndex, ratio } = findInterpolation(this.auxiliaryEntries, input.tws)
+    const lower = this.auxiliaryEntries[lowerIndex][name]
+    const upper = this.auxiliaryEntries[upperIndex][name]
+    const twa = Math.abs(input.twa)
+    const low = sampleLinear(lower, twa)
+    const high = sampleLinear(upper, twa)
+    let twaState = 'in_range'
+    if (lower.length && upper.length) {
+      if (twa < Math.max(lower[0].twa, upper[0].twa)) twaState = 'below_range'
+      else if (twa > Math.min(lower.at(-1).twa, upper.at(-1).twa)) twaState = 'above_range'
+    }
+    const state = validState(axisState(this.auxiliaryEntries, input.tws), twaState)
+    if (low === null || high === null) return { value: null, state: { ...state, available: false, reason: 'no_data' } }
+    return { value: interpolate(low, high, ratio), state }
+  }
+
+  auxiliariesAt(tws, twa) {
+    return Object.fromEntries(AUXILIARIES.map(name => [name, this.auxiliaryAt(name, { tws, twa }).value]))
   }
 
   rangeAt(options) {
@@ -121,33 +312,19 @@ class Polar {
     const interpolation = this.findTwsInterpolation(input.tws)
     const lower = this.entries[interpolation.lowerIndex]
     const upper = this.entries[interpolation.upperIndex]
+    const minTwa = Math.max(minTwaForEntry(lower, input.extrapolate), minTwaForEntry(upper, input.extrapolate))
+    const maxTwa = Math.min(maxTwaForEntry(lower, input.extrapolate), maxTwaForEntry(upper, input.extrapolate))
+    if (minTwa > maxTwa) {
+      return { value: null, state: { ...noDataState(), tws: this.twsState(input.tws) } }
+    }
     return {
-      value: {
-        minTwa: interpolate(minTwaForEntry(lower, input.extrapolate), minTwaForEntry(upper, input.extrapolate), interpolation.ratio),
-        maxTwa: interpolate(maxTwaForEntry(lower, input.extrapolate), maxTwaForEntry(upper, input.extrapolate), interpolation.ratio)
-      },
+      value: { minTwa, maxTwa },
       state: validState(this.twsState(input.tws), null)
     }
   }
 
   findTwsInterpolation(tws) {
-    let lowerIndex = -1
-    let upperIndex = -1
-    for (let index = 0; index < this.entries.length; index += 1) {
-      if (this.entries[index].tws <= tws) lowerIndex = index
-      if (this.entries[index].tws >= tws && upperIndex === -1) upperIndex = index
-    }
-    if (lowerIndex === -1) return { lowerIndex: 0, upperIndex: 0, ratio: 0 }
-    if (upperIndex === -1) {
-      const lastIndex = this.entries.length - 1
-      return { lowerIndex: lastIndex, upperIndex: lastIndex, ratio: 0 }
-    }
-    if (lowerIndex === upperIndex) return { lowerIndex, upperIndex, ratio: 0 }
-    return {
-      lowerIndex,
-      upperIndex,
-      ratio: (tws - this.entries[lowerIndex].tws) / (this.entries[upperIndex].tws - this.entries[lowerIndex].tws)
-    }
+    return findInterpolation(this.entries, tws)
   }
 
   twsState(tws) {
@@ -164,8 +341,8 @@ class Polar {
     const normalizedTwa = Math.abs(twa)
     const lower = this.entries[interpolation.lowerIndex]
     const upper = this.entries[interpolation.upperIndex]
-    const minTwa = interpolate(minTwaForEntry(lower, extrapolate), minTwaForEntry(upper, extrapolate), interpolation.ratio)
-    const maxTwa = interpolate(maxTwaForEntry(lower, extrapolate), maxTwaForEntry(upper, extrapolate), interpolation.ratio)
+    const minTwa = Math.max(minTwaForEntry(lower, extrapolate), minTwaForEntry(upper, extrapolate))
+    const maxTwa = Math.min(maxTwaForEntry(lower, extrapolate), maxTwaForEntry(upper, extrapolate))
 
     if (!extrapolate) {
       let twaState = 'in_range'
@@ -177,7 +354,9 @@ class Polar {
     const hasBeat = Number.isFinite(lower.beatAngle) && Number.isFinite(upper.beatAngle)
     const beatAngle = hasBeat ? interpolate(lower.beatAngle, upper.beatAngle, interpolation.ratio) : null
     let twaState = 'in_range'
-    if (normalizedTwa < minTwa) twaState = hasBeat ? 'in_irons' : 'below_range'
+    const hasPinch = lower.points[0].twa < lower.realPoints[0].twa &&
+      upper.points[0].twa < upper.realPoints[0].twa
+    if (normalizedTwa < minTwa) twaState = hasPinch ? 'in_irons' : 'below_range'
     else if (hasBeat && normalizedTwa < beatAngle) twaState = 'pinching'
     else {
       const lastTwa = Math.max(lower.points.at(-1).twa, upper.points.at(-1).twa)
@@ -193,18 +372,32 @@ function prepareEntries(table) {
   const entries = table.axes.tws.flatMap((tws, rowIndex) => {
     const axisPoints = table.axes.twa
       .map((twa, colIndex) => ({ twa, speed: table.values.boatSpeedMatrix[rowIndex][colIndex] }))
-      .filter(point => point.speed > 0)
-    if (axisPoints.length === 0) return []
+      .filter(point => Number.isFinite(point.speed))
 
     const points = axisPoints.slice()
+    const sourceRow = table.derived?.rows?.find(row => row.tws === tws)
     const target = {
-      beat: points.some(point => point.twa < Math.PI / 2) ? targets[rowIndex].beat : null,
-      run: points.some(point => point.twa >= Math.PI / 2) ? targets[rowIndex].run : null
+      beat: targets[rowIndex].beat,
+      run: targets[rowIndex].run
     }
     addTarget(points, target.beat)
     addTarget(points, target.run)
+    if (!points.length && Number.isFinite(sourceRow?.maxSpeed) && Number.isFinite(sourceRow?.maxSpeedAngle)) {
+      points.push({ twa: sourceRow.maxSpeedAngle, speed: sourceRow.maxSpeed })
+    }
+    if (points.length === 0) return []
     points.sort((a, b) => a.twa - b.twa)
     const derived = deriveTargets(points, target)
+    if (Number.isFinite(sourceRow?.maxSpeed) && Number.isFinite(sourceRow?.maxSpeedAngle)) {
+      derived.maxSpeed = sourceRow.maxSpeed
+      derived.maxSpeedAngle = sourceRow.maxSpeedAngle
+    }
+    const auxiliaries = prepareAuxiliaries(table, rowIndex)
+    const targetAux = Object.fromEntries(TARGETS.map(name => [
+      name, Object.fromEntries(AUXILIARIES.map(quantity => [
+        quantity, sourceRow?.[name]?.[quantity] ?? sampleLinear(auxiliaries[quantity], derived[`${name}Angle`])
+      ]))
+    ]))
     const realPoints = points.slice()
 
     const extended = addRunExtension(axisPoints, addBeatExtension(points, derived), derived)
@@ -212,14 +405,14 @@ function prepareEntries(table) {
     const realTangents = pchipTangents(realPoints)
     const runFlatten = buildRunFlatten(extended, tangents, derived)
 
-    return [{ tws, points: extended, tangents, realPoints, realTangents, runFlatten, ...derived }]
+    return [{ tws, points: extended, tangents, realPoints, realTangents, runFlatten, targetAux, ...derived }]
   })
 
   if (entries.length === 0) return []
 
   const first = entries[0]
   entries.unshift({
-    tws: 0.0001,
+    tws: Math.min(0.0001, first.tws / 2),
     points: first.points.map(point => ({ ...point, speed: 0 })),
     tangents: first.tangents.map(() => 0),
     realPoints: first.realPoints.map(point => ({ ...point, speed: 0 })),
@@ -232,7 +425,8 @@ function prepareEntries(table) {
     runSpeed: 0,
     runVmg: 0,
     maxSpeed: 0,
-    maxSpeedAngle: first.maxSpeedAngle
+    maxSpeedAngle: first.maxSpeedAngle,
+    targetAux: first.targetAux
   })
   return entries.map(entry => Object.freeze({
     ...entry,
@@ -246,6 +440,7 @@ function prepareEntries(table) {
 // Prepends a synthetic zero-speed endpoint so the PCHIP curve reaches 25deg on
 // the beat side without using the query cutoff to shape the curve.
 function addBeatExtension(points, derived) {
+  if (points.length < 2) return points
   if (!Number.isFinite(derived.beatAngle) || derived.beatAngle <= BEAT_ENDPOINT_ANGLE) return points
   if (points[0].twa <= BEAT_ENDPOINT_ANGLE + EPSILON) return points
   return [{ twa: BEAT_ENDPOINT_ANGLE, speed: 0 }, ...points]
@@ -413,8 +608,9 @@ function speedFromEntry(entry, twa, extrapolate) {
 
 function minTwaForEntry(entry, extrapolate) {
   if (!extrapolate) return entry.realPoints[0].twa
+  if (entry.points[0].twa === entry.realPoints[0].twa) return entry.realPoints[0].twa
   return Number.isFinite(entry.beatAngle)
-    ? BEAT_ENDPOINT_ANGLE + PINCH_FACTOR * (entry.beatAngle - BEAT_ENDPOINT_ANGLE)
+    ? Math.min(entry.realPoints[0].twa, BEAT_ENDPOINT_ANGLE + PINCH_FACTOR * (entry.beatAngle - BEAT_ENDPOINT_ANGLE))
     : entry.points[0].twa
 }
 
