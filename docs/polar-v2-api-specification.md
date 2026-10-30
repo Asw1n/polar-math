@@ -1,7 +1,9 @@
 # Polar-format v2 support: API specification
 
-Status: agreed design for implementation. This document describes intended
-behaviour, not functionality already available in the package.
+Status: agreed design, implemented and verified in this source tree. These API
+changes are unreleased; no package version has been assigned. See the
+[README](../README.md) for the concrete search algorithm, evaluation accounting,
+compatibility notes and reproducible benchmark results.
 
 ## 1. Scope and responsibilities
 

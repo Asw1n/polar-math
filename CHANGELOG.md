@@ -3,6 +3,29 @@
 All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Added
+
+- `Polar.fromPolarSet(set, sailplanId?)` prepares one v2 best/sailplan table with
+  immutable shared root context; v1 `fromTable` remains supported.
+- Linear, nullable `heelAt`, `reefAt`, `flatAt` queries and auxiliary target
+  fields with supplied-target precedence and matrix fallback.
+- Layered `waveFactorAt`, optional complete sea states for speed/VMG/targets,
+  explicit per-scalar/per-target correction status, and tack-aware targets.
+- Independently budgeted, deterministic multi-region corrected target searches,
+  per-target effort/status, and reproducible routing benchmarks.
+- Agreed v2 API specification, implementation documentation and regression tests.
+
+### Changed
+
+- Require published `polar-format ^2.0.0` for v1/v2 schema and semantic validation.
+- Skip interior null speed samples, trim null edges, preserve exact/lone samples
+  and treat numeric zero as real speed in both loaders (not missing data).
+- Between-row ranges describe common speed coverage; unavailable scalar values
+  consistently report `available: false`. Pinch extensions never hide real samples.
+- Preserve stored maximum-speed/angle pairs as well as existing beat/run inputs.
+
 ## 1.1.1 - 2026-09-15
 
 ### Fixed
